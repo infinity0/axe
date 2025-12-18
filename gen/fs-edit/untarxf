@@ -1,0 +1,70 @@
+#!/bin/sh
+# Remove the output of an accidental `tar xf`.
+#
+# TODO [#C]: check that each file being removed is (probably) the same as the
+# one as from the tarball
+set -e -o pipefail # POSIX:2022
+
+DRYRUN=false
+VERBOSE=false
+KEEPGOING=false
+USAGE="Usage: $0 [-n] [-v] [-k] <TAR FILE>"
+while getopts nvkh o; do
+	case $o in
+	n ) DRYRUN=true;;
+	v ) VERBOSE=true;;
+	k ) KEEPGOING=true;;
+	h )
+		cat <<-EOF
+		$USAGE
+
+		Remove the output of an accidental \`tar xf\`.
+
+		Arguments:
+		FILE                Tarball whose outputs to remove.
+
+		Options:
+		  -n                Print the commands to be run, but don't run them.
+		  -v                Run the commands and also print them.
+		  -k                Keep going if any member can't be removed e.g.
+		                    because you manually removed the file already, or
+		                    because the directory contains other stuff not from
+		                    the tarball.
+		  -h                This help text.
+		EOF
+		exit 0
+		;;
+	\? ) echo $USAGE; exit 1;;
+	esac
+done
+shift `expr $OPTIND - 1`
+
+maybe() {
+	local cmd="$1"
+	local file="$2"
+	local flags=
+	if $DRYRUN; then
+		/usr/bin/printf "%s %q\n" "$cmd" "$file" # %q is not POSIX
+		return
+	fi
+
+	if $VERBOSE; then
+		flags="${flags} --verbose"
+	fi
+
+	if $KEEPGOING; then
+		"$cmd" $flags "$file" || true
+	else
+		"$cmd" $flags "$file"
+	fi
+}
+
+tar --quoting-style=escape -tf "$1" | sort -r | while read -r i; do
+	# end with a dot to prevent shell stripping away whitespace after printf
+	f="$(printf "%b." "$i")"
+	if [ "${f%/.}" != "$f" ]; then
+		maybe rmdir "${f%.}"
+	else
+		maybe rm "${f%.}"
+	fi
+done

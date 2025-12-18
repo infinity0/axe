@@ -1,0 +1,72 @@
+#!/bin/bash
+# Get a Firefox/Thunderbird password.
+#
+# dep: pip/https://github.com/unode/firefox_decrypt
+# dep: apt/libnss3 # indirect dependency of firefox_decrypt
+# dep: apt/xclip
+set -e -o pipefail # POSIX:2022
+
+profdir="${profdir:-$HOME/.mozilla/firefox}"
+profile="${profile:-$USER}"
+host=$(printf "%s\n" "$1" | sed -re 's,^([^:]+://[^/]+)/.*,\1,g')
+user="$2"
+test -n "$host" || exit 2
+
+which -s firefox_decrypt
+
+num_entries() {
+	if [ -z "$1" ]; then echo 0; else printf "%s\n" "$1" | wc -l; fi
+}
+
+if ! [ "$profile" -ge 0 2>/dev/null ]; then
+profiles="$(
+firefox_decrypt -l "$profdir" \
+  | egrep "[0-9]+ -> .*${profile}" \
+  || true
+)"
+
+case $(num_entries "$profiles") in
+0)
+	echo >&2 "no matches for profile: $profile"
+	firefox_decrypt -l "$profdir"
+	exit 1
+	;;
+1)
+	profile="$(printf "%s" "$profiles" | egrep -o '^[0-9]+')"
+	;;
+*)
+	echo >&2 "more than 1 match for profile: $profile, please refine:"
+	printf "%s\n" "$profiles"
+	exit 1
+	;;
+esac
+fi
+
+matches="$(
+firefox_decrypt -c"$profile" -fcsv -d '\t' -q '分' "$profdir" | tr -d '分' \
+  | grep -P '^[^\t]*'"$host"'[^\t]*\t[^\t]*'"$user"'[^\t]*' \
+  || true
+)"
+
+case $(num_entries "$matches") in
+0)
+	echo >&2 "no matches"
+	exit 1
+	;;
+1)
+	pass="$(printf "%s\n" "$matches" | cut -d$'\t' -f3)"
+	printf "%s\n" "$matches" | cut -d$'\t' -f1,2 >&2
+	if [ -z "$DISPLAY" ]; then
+		printf "%s\n" "$pass"
+	else
+		printf "%s" "$pass" | xclip -selection clipboard
+		{ sleep 16; echo "" | xclip -selection clipboard; } &
+		echo >&2 "copied to clipboard; will clear it after 16s"
+	fi
+	;;
+*)
+	echo >&2 "more than 1 match, please refine HOST or USER:"
+	printf "%s" "$matches" | cut -d$'\t' -f1,2
+	exit 1
+	;;
+esac

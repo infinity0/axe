@@ -1,0 +1,16 @@
+#!/bin/sh
+# Run argv[2:] preserving the timestamp of argv[1].
+set -e -o pipefail # POSIX:2022
+
+d="$1"
+shift
+ts="$(stat -c %.9Y "$d")"
+
+reset_ts() {
+	set -x
+	touch -d@"$ts" "$d"
+	{ set +x; } 2>/dev/null
+}
+trap 'reset_ts; trap - EXIT' EXIT HUP INT QUIT PIPE TERM
+
+"$@"

@@ -1,0 +1,22 @@
+#!/bin/sh
+# Stow all binaries into bin/.
+#
+# dep: apt/stow
+#
+# # useful tools that complement the scripts here
+# opt: apt/fd-find
+# opt: apt/ripgrep
+# opt: apt/du-dust
+set -e -o pipefail # POSIX:2022
+
+scriptdir="$(dirname "$0")"
+cd "$scriptdir"
+
+#rm -rf bin
+mkdir -p bin
+find . -mindepth 1 -maxdepth 1 -type d \
+  -not -name bin -not -name .git -printf "%P\n" | sort | while read p; do
+	mkdir -p "bin/$p"
+	stow -t "bin/$p" -d "$p" "$@" $(ls "$p")
+done
+find bin -xtype l -delete

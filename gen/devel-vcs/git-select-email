@@ -1,0 +1,32 @@
+#!/bin/sh
+# Quick way to select your user.email if you have multiple of them.
+# The emails are chosen from your GPG key and from user.selectableEmail.
+#
+# dep: apt/git
+# dep: apt/gpg
+# dep: apt/dialog
+set -e -o pipefail # POSIX:2022
+
+GNUPGBIN="${GNUPGBIN:-gpg}"
+
+get_emails() {
+	local signingkey="$(git config user.signingkey)"
+	if test -n "$signingkey"; then
+		$GNUPGBIN --with-colons -k "$signingkey" | grep uid:u | cut -d: -f10 | sed -nre 's/.*<(.*)>.*/\1/gp'
+	fi
+	git config --get-all user.selectableEmail || true
+}
+
+emails="$(get_emails | sed -e 's/.*/\0 \0/g')"
+if test -z "$emails"; then
+	echo >&2 "abort: no emails detected; you need to either:"
+	echo >&2 "- set user.signingkey and we will use that GPG key's emails, or"
+	echo >&2 "- set user.selectableEmail one or more times"
+	exit 1
+fi
+
+exec 3>&1; email="$(dialog --output-fd 4 --no-tags \
+--title "Select a value for user.email" --default-item "$(git config user.email)" \
+--menu "Emails for key $signingkey" 24 80 20 $emails 4>&1 >&3)"
+
+test -n "$email" && git config user.email "$email"

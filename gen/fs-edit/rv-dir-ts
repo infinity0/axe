@@ -1,0 +1,106 @@
+#!/usr/bin/python
+"""
+Revert the timestamp of a directory to the latest of its contents.
+
+See --help/-h for overview and usage info.
+"""
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import argparse
+import re
+import os
+import sys
+
+NANOS_PER_SEC = 1_000_000_000
+MICROS_PER_SEC = 1_000_000
+SECS_PER_DAY = 24 * 60 * 60
+
+def format_nanos(ns):
+	return datetime.fromtimestamp(ns // NANOS_PER_SEC).isoformat()
+
+def fake_relpath(d, start=None):
+	return d
+
+def format_delta(diff):
+	diffd = str(timedelta(microseconds=diff // NANOS_PER_SEC * MICROS_PER_SEC))
+	return "%020s" % re.sub(r", (\d):", r",  \1:", diffd)
+
+def run(top, d, args, level=0):
+	relpath = os.path.relpath if args.relative else fake_relpath
+	with os.scandir(d) as it:
+		entries = list(it)
+		subdirs = [e for e in entries if e.is_dir(follow_symlinks=False)]
+		others = [e for e in entries if not e.is_dir(follow_symlinks=False)]
+
+		mtime_ns_d = max((run(top, e, args, level+1) for e in subdirs), default=0)
+		mtime_ns_ff = [(e, e.stat(follow_symlinks=False).st_mtime_ns) for e in others]
+		# always warn if we see a file newer than newer_date
+		for e, m in mtime_ns_ff:
+			if args.newer_date and m > args.newer_date:
+				print("%02s" % level,
+				  "|", format_nanos(m), ">>", format_nanos(args.newer_date),
+				  "| WARN: file newer than --newer-date:", format_delta(m - args.newer_date),
+				  "|", relpath(e.path, start=top), file=sys.stderr)
+		mtime_ns_f = max((m for e, m in mtime_ns_ff), default=0)
+
+		mtime_ns_new = max((mtime_ns_f, mtime_ns_d))
+		mtime_ns = d.stat(follow_symlinks=False).st_mtime_ns
+		diff = mtime_ns - mtime_ns_new
+		if mtime_ns_new > 0:
+			warn = args.warn_older and diff < 0
+			act = "<<" if warn else "->"
+			wfp = sys.stderr if warn else sys.stdout
+			if warn or mtime_ns > args.newer_date and diff > args.min_gap_days * SECS_PER_DAY * NANOS_PER_SEC:
+				part1 = ["%02s" % level,
+				  "|", format_nanos(mtime_ns), act, format_nanos(mtime_ns_new)]
+				part2 = ["| WARN: dir older than its contents: ",
+				  format_delta(-diff)] if warn else ["- ", format_delta(diff)]
+				part3 = ["| f:", format_nanos(mtime_ns_f),
+				  "d:", format_nanos(mtime_ns_d)] if args.verbose else []
+				part4 = ["|", relpath(d.__fspath__(), start=top)]
+				print(*(part1 + part2 + part3 + part4), file=wfp)
+				if not warn:
+					if args.execute:
+						os.utime(d.__fspath__(), ns=(mtime_ns_new, mtime_ns_new))
+					return mtime_ns_new
+		return mtime_ns
+
+def main(*argv):
+	parser = argparse.ArgumentParser(
+	  prog="rv-dir-ts",
+	  description="Revert the timestamp of a directory to the latest of its\
+	  contents. This is useful e.g. when your editor creates temporary files\
+	  in a backup snapshot that you accidentally mounted read-write.")
+
+	parser.add_argument('dirs', nargs='+',
+	  help="Directory(ies) whose timestamps to revert.")
+	parser.add_argument('-r', '--relative', action=argparse.BooleanOptionalAction,
+	  help="Print relative paths in output.")
+	parser.add_argument('-v', '--verbose', action=argparse.BooleanOptionalAction,
+	  help="Print extra details about the revert plan.")
+	parser.add_argument('-m', '--min-gap-days', type=float, default=30,
+	  help="Only revert timestamps that would change more than this many days.")
+	parser.add_argument('-n', '--newer-date', default="1970-01-01",
+	  help="Only revert timestamps newer than this date (%%Y-%%m-%%d). This is\
+	  meant as a sanity check to avoid reverting directories that should be\
+	  sufficiently old. Furthermore, we also warn you about any files newer\
+	  than this date, in case you expected them to all be older.")
+	parser.add_argument('-x', '--execute', action=argparse.BooleanOptionalAction,
+	  help="Execute the revert. By default the plan is only printed.")
+	parser.add_argument('-w', '--warn-older', action=argparse.BooleanOptionalAction,
+	  help="Warn about directories older than its contents. This is just for\
+	  info, it is not that rare e.g. for build dirs, and you needn't worry.")
+
+	args = parser.parse_args(argv)
+	args.newer_date = datetime.strptime(
+	  args.newer_date + "Z", "%Y-%m-%d%z").timestamp() * NANOS_PER_SEC
+
+	for d in args.dirs:
+		run(d, Path(d), args, 0)
+
+	if not args.execute:
+		print("Pass --execute to actually execute the above (if any).", file=sys.stderr)
+
+if __name__ == "__main__":
+	sys.exit(main(*sys.argv[1:]))

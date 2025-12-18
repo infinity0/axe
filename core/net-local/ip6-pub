@@ -1,0 +1,12 @@
+#!/bin/sh
+# Get all globally-public IPv6 addresses of the current host.
+#
+# dep: apt/iproute2
+# dep: apt/jq
+set -e -o pipefail # POSIX:2022
+
+ip -j -6 addr show primary scope global | jq -e -r '
+	.[] .addr_info[]
+	|select(.prefixlen == 128) .local
+	|select(. as $i |any("fd", "fc"; . as $p |$i |startswith($p)) |not)'
+# could be cleaner with https://github.com/jqlang/jq/issues/3443

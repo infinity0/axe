@@ -1,0 +1,802 @@
+#!/usr/bin/python
+"""Read high-level multimedia metadata.
+
+See --help/-h for overview and usage info.
+
+dep: apt/libimage-exiftool-perl
+dep: apt/ffmpeg
+rec: pip/tzfpy
+"""
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
+
+from functools import partial, reduce
+from multiprocessing.pool import ThreadPool
+from subprocess import Popen, PIPE
+
+import argparse
+import json
+import os
+import re
+import sys
+import textwrap
+import traceback
+
+def identity(x):
+	return x
+
+KEYS = {
+	"file": "file",
+	"type": "mimetype",
+	"meta": "metadata",
+	"src": "source",
+	"raw": "raw_input",
+	"err": "error",
+	"warn": "warnings",
+	"phys": "physical",
+	"art": "artistic",
+	"qual": "quality",
+	"pos": "position",
+	"rts": "record_ts",
+	"cts": "create_ts",
+	"mts": "modify_ts",
+	"dim": "dimensions",
+	"dur": "duration",
+	"ctnr": "container",
+	"fname": "format_name",
+	"fdesc": "format_name_long",
+	"bps": "bit_rate",
+	"idx": "index",
+	"ctype": "codec_type",
+	"cname": "codec_name",
+	"cdesc": "codec_description",
+	"cprof": "codec_profile",
+	"fps": "frame_rate",
+	"sps": "sample_rate",
+}
+
+def extract(inres, tool, key1, key2, parser=None, optional=False):
+	s = inres.get(tool, {}).get(key1, {}).get(key2)
+	if s is None:
+		if optional:
+			return None
+		raise ValueError(f"key not found: {key1}/{key2}")
+	elif parser:
+		d = parser(s)
+		return ({f"{tool}/{key1}/{key2}": s}, d) if d is not None else None
+	else:
+		return s
+
+def list_setdefault(l, i, mkdefault):
+	# if we e.g. emit a warning for the 5th stream but not the other streams,
+	# then we need to fill in all the previous streams to make the indexes work
+	while i >= len(l):
+		l.append(mkdefault())
+	return l[i]
+
+def get_setter(k, top, cat, *keys):
+	path = [cat] + list(keys)
+	cur = top
+	for p, n in zip(path[:-1], path[1:]):
+		if type(n) == str:
+			mknext = lambda: {}
+		elif type(n) == int:
+			mknext = lambda: []
+		else:
+			raise TypeError(f"unsupported path component {n}")
+		if type(p) == str:
+			cur = cur.setdefault(k(p), mknext())
+		elif type(p) == int:
+			cur = list_setdefault(cur, p, mknext)
+		else:
+			assert False, "unsupported path component, but it was checked already"
+	# k(n) should return n for int n
+	return lambda val: cur.__setitem__(k(n), val)
+
+def record(k, outres, cat, *keys, src, val):
+	get_setter(k, outres, "meta", cat, *keys)(val)
+	get_setter(k, outres, "src", cat, *keys)(src)
+
+def record_warning(k, outres, cat, *keys, info):
+	get_setter(k, outres, "warn", cat, *keys)(info)
+
+def record_warning_exc(k, outres, cat, *keys):
+	record_warning(k, outres, cat, *keys, info=traceback.format_exc())
+
+def parse_position(s):
+	y, x = s.split(" ", maxsplit=1) # exiftool outputs latitude first
+	return float(x), float(y)
+
+def parse_tz(s):
+	return timezone(timedelta(seconds=int(s)*60))
+
+def parse_dtZ(s):
+	return datetime.strptime(s, r"%Y:%m:%d %H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+def parse_dt(s):
+	if s == "0000:00:00 00:00:00":
+		return None
+	return datetime.strptime(s, r"%Y:%m:%d %H:%M:%S")
+
+def parse_dt_any(s):
+	pattern = r"%Y:%m:%d %H:%M:%S"
+	if "." in s:
+		pattern += ".%f"
+	#https://github.com/python/cpython/issues/121237
+	sz = re.sub(r"([-+][\d:]+)", lambda m: m.group(1).replace(":", ""), s)
+	if len(sz) != len(s):
+		pattern += "%z"
+	# TODO [#K]: for some files e.g. my 20250228_141458_GOPR.jpg, SubSec* is
+	# present but with an extra space e.g. " 690" that exiftool isn't gracious
+	# enough to ignore. we should file a bug upstream.
+	return datetime.strptime(sz, pattern)
+
+def parse_dimensions(s):
+	w, h = s.split(" ", maxsplit=1)
+	return int(w), int(h)
+
+def parse_duration_any(s):
+	try:
+		return parse_duration(s)
+	except (TypeError, ValueError):
+		pattern = r"%H:%M:%S"
+		if "." in s:
+			pattern += ".%f"
+			# strptime doesn't support nanoseconds for now, drop them
+			s = re.sub(r"(\.\d\d\d\d\d\d)\d+", lambda m: m.group(1), s)
+		dt = datetime.strptime(s, pattern)
+		return timedelta(hours=dt.hour, minutes=dt.minute, seconds=dt.second, microseconds=dt.microsecond)
+
+def parse_duration(s):
+	return timedelta(seconds=float(s))
+
+def guess_tz(inres, rtime_naive, pos):
+	src = {}
+	orig_tz = None
+
+	# try GoPro metadata
+	tz_gopro = extract(inres, "exiftool", "QuickTime:GoPro:Camera", "TimeZone", parse_tz, optional=True)
+	if tz_gopro:
+		src |= tz_gopro[0] | {"assuming GoPro stored QuickTime:Time as": "UTC"}
+		return src, (timezone.utc, tz_gopro[1])
+
+	# try GPS timestamp
+	gtime = extract(inres, "exiftool", "Composite:Composite:Time", "GPSDateTime", parse_dtZ, optional=True)
+	if gtime:
+		td = rtime_naive - gtime[1].replace(tzinfo=None) # GPS timestamp is always in UTC
+		# round to nearest 15 min since camera clocks can be inaccurate
+		offset = round(td.total_seconds() / 900) * 900
+		src |= gtime[0] | {"QuickTime:Time - GPSDateTime": offset}
+		orig_tz = timezone(timedelta(seconds=offset))
+
+	# try GPS location
+	if pos:
+		import tzfpy
+		# TODO [#K]: potentially inaccurate for old dates due to https://github.com/ringsaturn/tzfpy/issues/108
+		tz = tzfpy.get_tz(*pos[1])
+		src |= pos[0] | {"tzfpy.get_tz(%s, %s)" % pos[1]: tz}
+		android_make = extract(inres, "exiftool", "QuickTime:Keys:Other", "AndroidMake", optional=True)
+		if orig_tz:
+			pass # reuse value deduced earlier
+		elif android_make:
+			src |= {"assuming Android stored QuickTime:Time as": "UTC"}
+			orig_tz = timezone.utc
+		else:
+			src |= {"WARNING: TOTALLY GUESSING THAT QuickTime:Time is in": "UTC"}
+			orig_tz = timezone.utc
+		return src, (orig_tz, ZoneInfo(tz))
+
+	# fall back to outputting in orig_tz
+	return (src, (orig_tz, orig_tz)) if orig_tz else None
+
+def extract_time(inres, key):
+	# TODO [#C]: exiftool should unify these in Composite:Composite:Time/*{key}
+	# TODO [#K]: subseconds in QuickTime etc?
+	return extract(inres, "exiftool", "Composite:Composite:Time", f"SubSec{key}", parse_dt_any, optional=True) \
+	  or extract(inres, "exiftool", "QuickTime:QuickTime:Time", key, parse_dt, optional=True) \
+	  or extract(inres, "exiftool", "EXIF:ExifIFD:Time", key, parse_dt, optional=True) \
+	  or extract(inres, "exiftool", "EXIF:IFD0:Time", key, parse_dt, optional=True)
+
+def guess_times(k, inres, outres, pos):
+	keys = {"rts": "DateTimeOriginal", "cts": "CreateDate", "mts": "ModifyDate"}
+	times = {outk: extract_time(inres, ink) for outk, ink in keys.items()}
+	times = {outk: res for outk, res in times.items() if res}
+	naive = {outk: res for outk, res in times.items() if not res[1].tzinfo}
+	full = {outk: res for outk, res in times.items() if res[1].tzinfo}
+	if naive:
+		if len(set(res[1].tzinfo for res in full.values())) == 1:
+			# other timestamps have consistent TZ, copy it over
+			okf, resf = next(iter(full.items()))
+			src = {"TZ copied from": next(iter(resf[0].keys()))}
+			for outk, res in naive.items():
+				times[outk] = res[0] | src, res[1].replace(tzinfo=resf[1].tzinfo)
+		else:
+			# guess the TZ via more sophisticated means
+			tzinfo = guess_tz(inres, next(iter(naive.values()))[1], pos)
+			if tzinfo:
+				for outk, res in naive.items():
+					times[outk] = res[0] | tzinfo[0], res[1].replace(tzinfo=tzinfo[1][0]).astimezone(tzinfo[1][1])
+			else:
+				# TODO [#C]: keep an eye out for any other options for guessing timezone
+				record_warning(k, outres, "phys", "failed to get timezone, ignoring naive timestamps",
+					info={k(outk): res[0] for outk, res in naive.items()})
+				return full
+	return times
+
+def extract_dur(inres, mimetype):
+	# TODO [#C]: exiftool should unify these in Composite:Composite:Video/Duration
+	# TODO [#C]: matroska duration is wrong https://github.com/exiftool/exiftool/issues/370
+	# low priority to fix, since we do trigger a warning, "inconsistent durations"
+	dur = extract(inres, "exiftool", "Composite:Composite:Video", "Duration", parse_duration, optional=True) \
+	  or extract(inres, "exiftool", "QuickTime:QuickTime:Video", "Duration", parse_duration, optional=True) \
+	  or extract(inres, "exiftool", "Matroska:Matroska:Video", "Duration", parse_duration_any, optional=True) \
+	  or extract(inres, "exiftool", "ASF:ASF:Video", "Duration", parse_duration, optional=True)
+	if not dur:
+		if mimetype == "video/x-msvideo":
+			# https://github.com/exiftool/exiftool/issues/371
+			vfr = extract(inres, "exiftool", "RIFF:RIFF:Video", "VideoFrameRate", float)
+			vfn = extract(inres, "exiftool", "RIFF:RIFF:Video", "VideoFrameCount", int)
+			asr = extract(inres, "exiftool", "RIFF:RIFF:Video", "AudioSampleRate", float)
+			asn = extract(inres, "exiftool", "RIFF:RIFF:Video", "AudioSampleCount", int)
+			dur = vfr[0] | vfn[0] | asr[0] | asn[0], timedelta(seconds=max(vfn[1] / vfr[1], asn[1] / asr[1]))
+		else:
+			raise ValueError(f"unknown file type for duration: {mimetype}")
+	return dur
+
+def meta_phys(args, k, inres, outres):
+	error = extract(inres, "exiftool", "ExifTool:ExifTool:ExifTool", "Error", optional=True)
+	if error:
+		record_warning(k, outres, "phys", "failed to get physical metadata, exiftool error", info=error)
+		return
+
+	mimetype = outres[k("type")]
+	mimetype0 = mimetype.split("/")[0]
+
+	if mimetype0 in ("image", "audio", "video"):
+		try:
+			pos = extract(inres, "exiftool", "Composite:Composite:Location", "GPSPosition", parse_position, optional=True)
+			if pos:
+				record(k, outres, "phys", "pos", src=pos[0], val=pos[1])
+		except Exception:
+			record_warning_exc(k, outres, "phys", "failed to get position")
+
+	if mimetype0 in ("image", "audio", "video"):
+		try:
+			times = guess_times(k, inres, outres, pos)
+			for outk, res in times.items():
+				record(k, outres, "phys", outk, src=res[0], val=res[1].isoformat())
+		except Exception:
+			record_warning_exc(k, outres, "phys", "failed to get timestamps")
+
+	if mimetype0 in ("image", "video"):
+		try:
+			dim = extract(inres, "exiftool", "Composite:Composite:Image", "ImageSize", parse_dimensions)
+			record(k, outres, "phys", "dim", src=dim[0], val=dim[1])
+		except Exception:
+			record_warning_exc(k, outres, "phys", "failed to get dimensions")
+
+	if mimetype0 in ("audio", "video"):
+		try:
+			dur = extract_dur(inres, mimetype)
+			record(k, outres, "phys", "dur", src=dur[0], val=dur[1].total_seconds())
+		except Exception:
+			record_warning_exc(k, outres, "phys", "failed to get duration", info=None)
+
+FTAG_WHITE = [
+	r"^product$",
+	r"^subject$",
+	r"^title$",
+	r"^description$",
+	r"^synopsis$",
+	r"^genre$",
+	r"^languages?$",
+	r"^subtitles?$",
+
+	r"^date($|-)", # e.g. release year
+	r"^compilation$",
+	r"^album$",
+	r"^track$",
+	r"^season_number$",
+	r"^episode_sort$",
+
+	r"^album_artist$",
+	r"^artist$",
+	r"^copyright($|-)",
+
+	r"^comment$",
+]
+
+FTAG_BLACK = [
+	r"^major_brand$",
+	r"^minor_version$",
+	r"^compatible_brands$",
+	r"^playback_requirements($|-)",
+	r"^encoder($|-)",
+	r"^encoded\s*by\b",
+
+	r"^software$",
+	r"^com\.android\.",
+	r"^com\.apple\.quicktime\.",
+	r"^iTunMOVI",
+	r"^WMFSDK",
+	r"^DeviceConformanceTemplate$",
+
+	r"^firmware$",
+	r"^make($|-)",
+	r"^model($|-)",
+
+	r"^hd_video$",
+	r"^IsVBR$",
+	r"^media_type$",
+	r"^creation_time$", # already repeated elsewhere
+	r"^location($|-)",  # already repeated elsewhere
+	r"^junk$",
+]
+
+STAG_WHITE = [
+	r"^title$",
+	r"^languages?$",
+]
+
+STAG_BLACK = [
+	r"^handler_name$",
+	r"^encoder($|-)",
+	r"^vendor_id$",
+
+	r"^_statistics_",
+	r"^number_of_",
+
+	r"^creation_time$",
+	r"^bps($|-)",       # already repeated elsewhere
+	r"^duration($|-)",  # already repeated elsewhere
+	r"^filename$",      # data/attachment streams, technical
+	r"^mimetype$",      # data/attachment streams, technical
+	r"^timecode$",      # data/attachment streams, technical
+]
+
+def record_ffprobe(k, outres, cat, keys, outk, container, ink, parser=identity, optional=False):
+	try:
+		val = container[ink]
+		res = parser(val)
+	except Exception:
+		if optional:
+			return None
+		raise
+	record(k, outres, cat, *keys, outk, src={f"ffprobe/$this/../{ink}": val}, val=res)
+	return res
+
+def record2_ffprobe(k, outres, cat, keys, outk, container, ink1, ink2, parser=identity):
+	val1 = container[ink1]
+	val2 = container[ink2]
+	res = parser((val1, val2))
+	record(k, outres, cat, *keys, outk, src={
+	  f"ffprobe/$this/../{ink1}": val1,
+	  f"ffprobe/$this/../{ink2}": val2,
+	  }, val=res)
+	return res
+
+def record_tags(k, outres, keys, container, whitelist, blacklist):
+	for t, v in container.get("tags", {}).items():
+		if any(re.search(p, t, flags=re.IGNORECASE) for p in whitelist):
+			record(k, outres, "art", *keys, t.lower(), src={"ffprobe/$this": v}, val=v)
+		elif any(re.search(p, t, flags=re.IGNORECASE) for p in blacklist):
+			continue
+		else:
+			record_warning(k, outres, "art", *keys, f"unrecognised tag: {t}", info=v)
+
+def meta_art(args, k, inres, outres):
+	container = inres.get("ffprobe", {}).get("format", {})
+	if not container: return
+	streams = inres.get("ffprobe", {}).get("streams", [])
+	if [s["index"] for s in streams] != list(range(len(streams))):
+		raise ValueError("unexpected unsorted streams from ffprobe")
+
+	record_tags(k, outres, ["ctnr"], container,
+	  whitelist=FTAG_WHITE, blacklist=FTAG_BLACK)
+	for (idx, stream) in enumerate(streams):
+		keys = ["streams", idx]
+		idx0 = record_ffprobe(k, outres, "art", keys, "idx", stream, "index")
+		assert idx0 == idx
+		ctype = record_ffprobe(k, outres, "art", keys, "ctype", stream, "codec_type")
+		record_tags(k, outres, keys, stream,
+		  whitelist=STAG_WHITE, blacklist=STAG_BLACK)
+
+def parse_frame_rate(s):
+	n, d = s.split("/", maxsplit=1)
+	return float(n) / float(d)
+
+def inv_rel_err(a, b):
+	if a == b:
+		return float("inf")
+	return 1 / abs(1 - (a / b))
+
+def check_durations(k, outres, keys, ctype, cdur, dur, threshold):
+	keystr = "/".join(str(k) for k in keys)
+	if cdur is None and dur is None:
+		record_warning(k, outres, "qual", *keys,
+		  f"{keystr}/{ctype} without explicit duration nor implicit from container", info=None)
+	elif cdur and dur and inv_rel_err(cdur, dur) < threshold:
+		record_warning(k, outres, "qual", *keys,
+		  f"{keystr}/{ctype} with different duration from container", info=(cdur, dur, inv_rel_err(cdur, dur)))
+
+# ffprobe classifies these as "video" streams but they don't have a meaningful
+# duration - either missing, or set to the overall file duration, which could
+# be either an image, audio, or video
+IMAGE_CODECS = ("mjpeg", "png")
+
+def meta_qual(args, k, inres, outres):
+	container = inres.get("ffprobe", {}).get("format", {})
+	if not container: return
+	streams = inres.get("ffprobe", {}).get("streams", [])
+	if [s["index"] for s in streams] != list(range(len(streams))):
+		raise ValueError("unexpected unsorted streams from ffprobe")
+
+	record_ffprobe(k, outres, "qual", ["ctnr"], "fname", container, "format_name")
+	record_ffprobe(k, outres, "qual", ["ctnr"], "fdesc", container, "format_long_name", optional=True)
+	dur = record_ffprobe(k, outres, "qual", ["ctnr"], "dur", container, "duration", parser=float, optional=True)
+	record_ffprobe(k, outres, "qual", ["ctnr"], "bps", container, "bit_rate", optional=True)
+	if not dur:
+		# warn if we really should have a duration. ignore the following false-positives:
+		# - some "video" streams are actually single-frame cover images
+		# - some subtitle files get a "video/mpeg" mimetype from exiftool due to their container format
+		mimetype0 = outres[k("type")].split("/")[0]
+		if mimetype0 == "audio" or mimetype0 == "video" and any(
+		  s["codec_type"] == "video" and s["codec_name"] not in IMAGE_CODECS for s in streams):
+			record_warning(k, outres, "qual", ["ctnr"], f"container/{mimetype0} without duration", info=None)
+
+	for (idx, stream) in enumerate(streams):
+		keys = ["streams", idx]
+		idx0 = record_ffprobe(k, outres, "qual", keys, "idx", stream, "index")
+		assert idx0 == idx
+		ctype = record_ffprobe(k, outres, "qual", keys, "ctype", stream, "codec_type")
+		req_cname = ctype in ("audio", "video", "subtitle")
+		cname = record_ffprobe(k, outres, "qual", keys, "cname", stream, "codec_name", optional=not req_cname)
+		record_ffprobe(k, outres, "qual", keys, "cdesc", stream, "codec_long_name", optional=not req_cname)
+		record_ffprobe(k, outres, "qual", keys, "cprof", stream, "profile", optional=True)
+		cdur = record_ffprobe(k, outres, "qual", keys, "dur", stream, "duration", parser=float, optional=True)
+		record_ffprobe(k, outres, "qual", keys, "bps", stream, "bit_rate", optional=True)
+		# we reduce the delta_threshold because it's actually quite common for
+		# stream durations to be slightly different from the container duration
+		if ctype == "audio":
+			check_durations(k, outres, keys, ctype, cdur, dur, args.delta_threshold / 2)
+			record_ffprobe(k, outres, "qual", keys, "sps", stream, "sample_rate")
+		if ctype == "video":
+			is_image = cname in IMAGE_CODECS
+			if not is_image:
+				check_durations(k, outres, keys, ctype, cdur, dur, args.delta_threshold / 2)
+			record_ffprobe(k, outres, "qual", keys, "fps", stream, "avg_frame_rate", parser=parse_frame_rate, optional=is_image)
+			record2_ffprobe(k, outres, "qual", keys, "dim", stream, "width", "height")
+
+	# TODO [#C]: anything else?
+	# TODO [#D]: estimate missing bps? e.g. format-bps - other-streams-bps
+	# but that gets weird if we have several missing of different types
+
+CATEGORY_PROC = {
+  "phys": meta_phys,
+  "art": meta_art,
+  "qual": meta_qual,
+}
+
+def _keys(a):
+	return a.keys() if isinstance(a, dict) else range(len(a))
+
+def merge_rec(a, b, path=[]):
+	for key in _keys(b):
+		if key in _keys(a):
+			if isinstance(a[key], dict) and isinstance(b[key], dict):
+				merge_rec(a[key], b[key], path + [str(key)])
+			elif isinstance(a[key], list) and isinstance(b[key], list):
+				merge_rec(a[key], b[key], path + [str(key)])
+			elif a[key] != b[key]:
+				raise Exception('Conflict at ' + '.'.join(path + [str(key)]))
+		elif isinstance(a, list):
+			assert key == len(a) # we iterate in order so this should be fine
+			a.append(b[key])
+		else:
+			a[key] = b[key]
+	return a
+
+def process(args, f, inres):
+	k = identity if args.abbr else lambda x: KEYS.get(x, x)
+	outres = {k("file"): f}
+
+	if not inres:
+		outres[k("err")] = "no input from any tools. probably, the file cannot be read"
+		return outres
+
+	if extract(inres, "exiftool", "File:System:Other", "FileSize") == 0:
+		record_warning(k, outres, "*", "file is empty", info=0)
+		return outres
+
+	try:
+		outres[k("type")] = extract(inres, "exiftool", "File:File:Other", "MIMEType")
+		for cat in args.category:
+			CATEGORY_PROC[cat](args, k, inres, outres)
+		if "phys" in args.category and "qual" in args.category:
+			meta = outres.get(k("meta"), {})
+			pdur = meta.get(k("phys"), {}).get(k("dur"), None)
+			qdur = meta.get(k("qual"), {}).get(k("ctnr"), {}).get(k("dur"), None)
+			if pdur and qdur and inv_rel_err(pdur, qdur) < args.delta_threshold:
+				record_warning(k, outres, "*", "inconsistent durations, exiftool vs ffprobe", info=(pdur, qdur, inv_rel_err(pdur, qdur)))
+	except Exception:
+		outres[k("err")] = traceback.format_exc()
+
+	if not args.src:
+		outres.pop(k("src"), None)
+	elif k("src") in outres:
+		outres[k("src")] = outres.pop(k("src")) # move to end
+
+	if (args.raw == "always"
+	  or (args.raw == "error" and k("err") in outres)
+	  or (args.raw == "warn" and any(e in outres for e in (k("err"), k("warn"))))):
+		outres[k("raw")] = inres
+
+	for ek in ("warn", "err"):
+		if k(ek) in outres:
+			outres[k(ek)] = outres.pop(k(ek)) # move to end
+
+	if args.merge:
+		for sect in ("meta", "src", "warn"):
+			if k(sect) in outres:
+				old = outres[k(sect)]
+				merged = reduce((lambda x, y: merge_rec(x, old.pop(k(y), {}))), args.category, {})
+				outres[k(sect)] = old | merged
+
+	return outres
+
+def run_exiftool(lvl, files):
+	fast = "-fast3" if lvl <= 1 else ""
+	cmd = f"exiftool {fast} -q -n -j -g:0:1:2 -struct --"
+	with Popen(cmd.split() + files, stdout=PIPE) as proc:
+		try:
+			return [(v["SourceFile"], v) for v in json.load(proc.stdout)]
+		except json.JSONDecodeError:
+			return [] # exiftool produces no output if no files could be read
+
+def run_ffprobe(lvl, file):
+	# TODO [#D]: ffprobe is slower than exiftool, esp unbatched :(
+	if lvl <= 1:
+		# stop ffprobe doing useless analysis we don't care about at this level
+		# see https://www.ffmpeg.org/ffprobe-all.html for details
+		noprobes = "-probesize 32 -max_probe_packets 1 -fflags nobuffer -analyzeduration 1 -fpsprobesize 1 -duration_probesize 1"
+	else:
+		noprobes = ""
+	cmd = f"ffprobe -v quiet -of json {noprobes} -show_format -show_streams"
+	with Popen(cmd.split() + [file], stdout=PIPE) as proc:
+		return (file, json.load(proc.stdout))
+
+def print_rfc822(obj, fp, sep="  ", lvl=0):
+	for k, v in obj.items():
+		assert(":" not in str(k) or lvl > 0)
+		print(f"{sep*lvl}{str(k).replace(":", "-")}:", end="", file=fp)
+		if type(v) == dict:
+			print(file=fp)
+			print_rfc822(v, fp, sep, lvl+1)
+		elif type(v) == list:
+			print(file=fp)
+			print_rfc822(dict(enumerate(v)), fp, sep, lvl+1)
+		elif type(v) == tuple:
+			print("", *v, file=fp)
+		else:
+			print("", v, file=fp)
+	if lvl == 0:
+		print(file=fp)
+
+class DiffChoices(object):
+	def __init__(self, choices):
+		self._choices = choices
+
+	def __iter__(self):
+		return self._choices.__iter__()
+
+	def __contains__(self, diffops):
+		try:
+			#print("DiffChoices.contains", diffops, file=sys.stderr)
+			return all(v in self._choices for op, vals in diffops for v in vals)
+		except ValueError:
+			return False
+
+class DiffOps(object):
+	def __init__(self, type, choices):
+		self._type = type
+		self._choices = choices
+
+	def __call__(self, opstr):
+		#print("DiffOps()", opstr, file=sys.stderr)
+		def parse_ops(opexpr):
+			op, vals = (opexpr[0], opexpr[1:]) if opexpr and opexpr[0] in "=+-" else ("+", opexpr)
+			return (op, self._choices if opexpr in ("*", "all") else opexpr.split(","))
+		return [
+		  (op, [self._type(val) if self._type is not None else val
+		    for val in vals if val])
+		  for op, vals in map(parse_ops, opstr.split(";"))]
+
+class DiffArgListAction(argparse.Action):
+	"""Specify edits to a default list of choices."""
+	def __init__(self, *args, **kwargs):
+		super().__init__(*args, **kwargs)
+		self.type = DiffOps(self.type, self.choices)
+		self.choices = DiffChoices(self.choices)
+
+	def __call__(self, parser, ns, diffops, option_string=None):
+		if getattr(ns, self.dest, None) is None:
+			setattr(ns, self.dest, [])
+		container = getattr(ns, self.dest)
+		#print("DiffArgListAction()", self.dest, "old", container, diffops, file=sys.stderr)
+		for op, vals in diffops:
+			if op == "=":
+				container[:] = vals
+			elif op == "+":
+				container.extend(vals)
+			elif op == "-":
+				container[:] = [c for c in container if c not in vals]
+			else:
+				assert False, f"unexpected op {op}"
+		#print("DiffArgListAction()", self.dest, "new", container, file=sys.stderr)
+
+class FileListActionNL(argparse.Action):
+	"""Read a newline-sep list of files into a Namespace dest.
+
+	Other actions on the same dest should have action 'extend' otherwise they
+	will overwrite the result from this one."""
+	def __call__(self, parser, ns, value, option_string=None):
+		if getattr(ns, self.dest, None) is None:
+			setattr(ns, self.dest, [])
+		files = [f for f in value.read().splitlines() if f]
+		getattr(ns, self.dest).extend(files)
+
+class FileListActionZ(argparse.Action):
+	"""Read a zero/NUL-sep list of files into a Namespace dest.
+
+	Other actions on the same dest should have action 'extend' otherwise they
+	will overwrite the result from this one."""
+	def __call__(self, parser, ns, value, option_string=None):
+		if getattr(ns, self.dest, None) is None:
+			setattr(ns, self.dest, [])
+		files = [f for f in value.read().split("\0") if f]
+		getattr(ns, self.dest).extend(files)
+
+def split_batches(a, n):
+	k, m = divmod(len(a), n)
+	return (a[i*k+min(i, m):(i+1)*k+min(i+1, m)] for i in range(n))
+
+def main(*argv):
+	parser = argparse.ArgumentParser(
+	  prog="mmm",
+	  formatter_class=argparse.RawDescriptionHelpFormatter,
+	  description=textwrap.dedent(r"""Read high-level multimedia metadata, specifically:
+
+  physical / phys
+    position   i.e. position in space / pos
+      longitude deg float, latitude deg float
+    timestamps i.e. positions in time / rts, cts, mts
+      record iso8601 str; create iso8601 str; modify iso8601 str
+    dimensions i.e. sizes in space    / dim
+      width px int, height px int
+    duration   i.e. size in time      / dur
+      duration sec float
+
+  artistic / art
+    container / ctnr
+      title, description, genre, artist, language, [..]
+    streams
+      codec_type / ctype
+      title, language, [..]
+    [.. and various others ..]
+    [.. technical noise is EXCLUDED, e.g. encoder, software, firmware, ..]
+
+  quality / qual
+    container / ctnr
+      format_name / fname
+      duration / dur
+      bit_rate / bps
+    streams
+      codec_type / ctype
+      codec_name / cname, codec_description / cdesc, codec_profile / cprof
+      duration / dur
+      bit_rate / bps
+    streams:audio
+      sample_rate / sps
+    streams:video
+      frame_rate / fps
+      dimensions / dim
+
+Some basic sanity checks are also run, with any failures output after the metadata.
+"""), epilog=textwrap.dedent(r"""Examples:
+
+  # Find all videos larger than 4K
+  $ find . -type f -print0 | mmm -I- | \
+      jq '.[] |select(.type|test("^video/")?) |select(.meta.phys.dim|(.[0] >= 3840 and .[1] >= 2160))'
+
+  # Print all artistic metadata
+  $ find . -type f -print0 | mmm -I- -k =art | \
+      jq '.[].meta.art//empty'
+
+  # Print all (supported) metadata in a concise human-readable format
+  $ find . -type f -print0 | mmm -I- -kall -m -f rfc822 "$file"
+"""))
+
+	parser.add_argument('files', nargs='*', action='extend',
+	  help="File(s) to act upon.")
+	parser.add_argument('-i', '--input', '--files-from', dest='files',
+	  type=argparse.FileType(), action=FileListActionNL,
+	  help="File with newline-separated list of file(s) to act upon. Give '-' for stdin.")
+	parser.add_argument('-I', '--input0', '--files0-from', dest='files',
+	  type=argparse.FileType(), action=FileListActionZ,
+	  help="File with NUL-separated list of file(s) to act upon. Give '-' for stdin.")
+	parser.add_argument('-o', '--output', type=argparse.FileType('w'), default='-',
+	  help="File to output results to. Give '-' for stdout. Default: %(default)s.")
+	parser.add_argument('-f', '--format', choices=["json","rfc822"], default="json",
+	  help="Output format. Default: %(default)s.")
+	parser.add_argument('-k', '--category',
+	  choices=["phys","art","qual"], default=["phys"], action=DiffArgListAction,
+	  help="Categories of metadata to output. Default: %(default)s. Give these \
+	  like e.g. 'art,qual;-phys' to edit the default, or '=art,qual' to \
+	  replace the default.")
+	parser.add_argument('-m', '--merge', action=argparse.BooleanOptionalAction, default=False,
+	  help="Whether to merge per-category results in the output. Default: %(default)s.")
+	parser.add_argument('--delta-threshold', default=256, type=int, metavar='UINT',
+	  help="Base inverse-relative-error threshold for warning about inconsistencies, \
+	  higher is stricter. We set the effective thresholds for each use-case, \
+	  based on this value. Default: %(default)s.")
+	parser.add_argument('--abbr', action=argparse.BooleanOptionalAction, default=True,
+	  help="Whether to abbreviate keys in the output. Default: %(default)s.")
+	parser.add_argument('--src', action=argparse.BooleanOptionalAction,
+	  help="Whether to include details of which specific inputs each output came from.")
+	parser.add_argument('--raw', choices=["never","warn","error","always"], default="error",
+	  help="When to include the entire raw inputs from all tools. Default: \
+	  error, i.e. yes if there was an error, no otherwise.")
+
+	args = parser.parse_args(argv)
+	#print(args, file=sys.stderr)
+	tools = {"exiftool": 1} # always run exiftool for easy mimetype
+	def ensure_min(tool, lv):
+		tools[tool] = max(lv, tools.get(tool, 0))
+	for cat in list(dict.fromkeys(args.category)):
+		if cat == "phys":
+			ensure_min("exiftool", 2)
+		elif cat == "art":
+			ensure_min("ffprobe", 1)
+		elif cat == "qual":
+			ensure_min("ffprobe", 2)
+
+	n = os.process_cpu_count()
+	toolres = {}
+	inres_all = {}
+	with ThreadPool(n) as pool:
+		if "exiftool" in tools:
+			lvl = tools["exiftool"]
+			exiftool_batches = [b for b in split_batches(args.files, n) if b]
+			toolres["exiftool"] = pool.imap_unordered(partial(run_exiftool, lvl), exiftool_batches, chunksize=1)
+
+		if "ffprobe" in tools:
+			# ffprobe does not support batches unfortunately
+			toolres["ffprobe"] = pool.imap_unordered(partial(run_ffprobe, lvl), args.files)
+
+		for res_batch in toolres.get("exiftool", []):
+			for fn, res in res_batch:
+				inres_all.setdefault(fn, {})["exiftool"] = res
+
+		for fn, res in toolres.get("ffprobe", []):
+			inres_all.setdefault(fn, {})["ffprobe"] = res
+	outres_all = [process(args, f, inres_all.get(f, {})) for f in args.files]
+
+	if args.format == "rfc822":
+		for outres in outres_all:
+			print_rfc822(outres, fp=args.output)
+	else:
+		json.dump(outres_all, fp=args.output)
+
+	return 1 if any(
+	  "err" in outres or KEYS["err"] in outres
+	  for outres in outres_all) else 0
+
+if __name__ == "__main__":
+	sys.exit(main(*sys.argv[1:]))
+	'''
+	dev checks:
+
+	# check errors and warnings
+	$ mmm ... | jq '.[].err//empty'
+	$ mmm ... | jq '.[].warn|values[]|keys[]//empty'
+	'''

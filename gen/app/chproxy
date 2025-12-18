@@ -1,0 +1,10 @@
+#!/bin/sh
+# Run Chromium in a temporary profile with a proxy server.
+set -e -o pipefail # POSIX:2022
+
+if [ -z "$PROFILE" ]; then
+  PROFILE_FLAGS="--temp-profile"
+else
+  PROFILE_FLAGS="--user-data-dir=$PROFILE"
+fi
+exec chromium "$PROFILE_FLAGS" --proxy-server="socks5://localhost:${PORT:-8950}" "$@"

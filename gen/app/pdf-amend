@@ -1,0 +1,77 @@
+#!/usr/bin/python3
+"""
+Amend PDFs more easily, e.g. to sign contracts with.
+
+dep: apt/python3-pypdf pip/pypdf
+dep: apt/gimp
+dep: apt/imagemagick apt/poppler-utils
+"""
+import argparse
+import contextlib
+import os
+import subprocess
+import sys
+
+from pypdf import PdfWriter, PageRange
+
+C = subprocess.check_call
+
+def main(argv):
+    parser = argparse.ArgumentParser(
+        description='Amend one page of a pdf document.')
+    parser.add_argument('orig_pdf', type=str)
+    parser.add_argument('page_num_to_amend', type=int, nargs='+')
+    parser.add_argument('-d', '--density-dpi', type=int, default=300)
+    parser.add_argument('-t', '--tool', choices=["imagemagick", "pdftoppm"], default="imagemagick",
+        help="Tool for PDF to PNG conversion. Default: %(default)s.")
+    parser.add_argument('-a', '--amend-with', action='append')
+    parser.add_argument('-o', '--output')
+    args = parser.parse_args(argv)
+
+    main, ext = os.path.splitext(args.orig_pdf)
+    pages = args.page_num_to_amend
+    amend_withs = args.amend_with
+    if not amend_withs:
+        amend_withs = ["%s.page-%s.amended%s" % (main, page, ext) for page in pages]
+    elif len(amend_withs) != len(pages):
+        raise ValueError("there must be an equal number of --amend-with as page_num_to_amend")
+    new_pdf = args.output or "%s.amended%s" % (main, ext)
+    pairs = sorted(zip(pages, amend_withs))
+
+    for (page, amend_with) in pairs:
+        pidx = page - 1
+        if os.path.exists(amend_with):
+            print("using existing amended page %s" % amend_with)
+        else:
+            print("%s does not exist; I will now open GIMP so you can edit page #%s in that file." % (amend_with, page))
+            print("After you have made your edits, do File -> Overwrite %s, then exit GIMP." % amend_with)
+            print("(It's safe to 'Discard Changes' after Overwrite.)")
+            input("Press enter to continue and run GIMP ")
+            amend_with_png = "%s.page-%s.amended.png" % (main, page)
+            if args.tool == "imagemagick":
+                # -antialias -colorspace RGB are needed otherwise the quality is shit
+                C(("convert -antialias -colorspace RGB -density %s -units pixelsperinch" % args.density_dpi).split() +
+                  ['%s[%s]' % (args.orig_pdf, pidx), amend_with_png])
+            else:
+                C(["sh", "-c", 'pdftoppm -png -f "$2" -l "$2" -r "$3" "$1" > "$4"', '--',
+                   args.orig_pdf, str(pidx), str(args.density_dpi), amend_with_png])
+            C(["gimp", amend_with_png])
+            C(["convert", amend_with_png, amend_with])
+
+    with contextlib.ExitStack() as stack:
+        orig = stack.enter_context(open(args.orig_pdf, 'rb'))
+        pdf = PdfWriter()
+        pidx = 0
+        for (page, amend_with) in pairs:
+            if page > pidx + 1:
+                pdf.merge(pidx, orig, pages = PageRange("%s:%s" % (pidx, page - 1)))
+            pidx = page - 1
+            pdf.merge(pidx, stack.enter_context(open(amend_with, 'rb')))
+            pidx += 1
+        pdf.merge(pidx, orig, pages = PageRange("%s:" % pidx))
+        pdf.compress_identical_objects()
+        pdf.write(new_pdf)
+        print("wrote %s" % new_pdf)
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

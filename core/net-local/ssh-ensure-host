@@ -1,0 +1,21 @@
+#!/bin/bash
+# Add an ssh key by hostname, if it is not already added.
+set -e -o pipefail # POSIX:2022
+
+host="$1"
+shift
+keyfile=$(ssh -G "$host" | sed -ne 's/identityfile //pi' | { read x y; echo $x; })
+keyfile="${keyfile/#\~/$HOME}"
+if [[ ! -f "$keyfile" ]]; then
+	echo >&2 "$0: no keyfile for host $host: $keyfile"
+	exit 1
+fi
+
+ssh_added_key() {
+	comm -12 <(ssh-add -l | sort) <(ssh-keygen -l -f "$1" | sort)
+}
+
+if [[ "$(ssh_added_key "$keyfile" | wc -l)" -eq 0 ]]; then
+    ssh-add -t43200 "$@" "$keyfile"
+fi
+ssh_added_key "$keyfile"

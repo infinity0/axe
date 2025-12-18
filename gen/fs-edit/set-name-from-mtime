@@ -1,0 +1,64 @@
+#!/bin/sh
+# Set a file's name based on its mtime.
+#
+# $2 is a sed replacement regex (e.g. /expr/repl/) with the additional syntax
+# that ** is replaced with the datetime.
+# $3 is a sed replacement regex (e.g. /expr/repl/) that looks up the mtime from
+# the replacement file rather than the original file.
+#
+# Set TZ to write the name in a particular timezone.
+# Set DS envvar to shift the time by that many seconds.
+set -e -o pipefail # POSIX:2022
+
+in="$1"
+d2='([0-9][0-9])'
+pat='/^([A-Za-z0-9]+_)?([0-9][0-9][0-9][0-9])'"${d2}${d2}_${d2}${d2}${d2}"'(.*)/\1**\8/'
+pat="${2:-${pat}}"
+pat="$(printf "%s" "$pat" | sed -e 's/\*\*/%Y%m%d_%H%M%S/g')"
+fpat="${3:-/^$//}"
+if [ "$DEBUG" = 1 ]; then
+	printf >&2 "pat: %s\n" "$pat"
+	printf >&2 "fpat: %s\n" "$fpat"
+fi
+
+test -n "$TZ" || { echo >&2 "TZ not set; will output in this machine's local timezone"; }
+
+ts="$(stat -c %Y "$(printf "%s\n" "$in" | sed -re "s${fpat}g")")"
+#echo >&2 "orig time $(date -d@$ts)"
+ts="$((ts + DS))"
+tf="$(basename "$in" | sed -nre "s${pat}gp")"
+out="$(dirname "$in")/$(date +"$tf" -d "@$ts")"
+if test -z "$tf"; then
+	printf >&2 "filename \"$(basename "$in")\" failed to match: %s\n" "$pat"
+	exit 1
+fi
+
+echo >&2 "$in --> $out"
+if [ "$in" = "$out" ]; then
+	exit 0
+fi
+
+execute=false
+if [ "$FORREALZ" = 1 ]; then
+	execute=true
+elif [ -n "$PS1" -o "$INTERACTIVE" = 1 ]; then
+	read -p "rename as above? [y/N] " x || true
+	if [ "$x" = "y" ]; then
+		execute=true
+	else
+		echo >&2 "aborted by user"
+	fi
+else
+	echo >&2 "set FORREALZ=1 to execute the above"
+fi
+
+if ! $execute; then
+	exit 1
+fi
+
+if ! test -f "$in"; then
+	echo >&2 "not a file: $in"
+	exit 1
+fi
+printf "%s\n" "$out"
+mv "$in" "$out"

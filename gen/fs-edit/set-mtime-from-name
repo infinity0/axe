@@ -1,0 +1,50 @@
+#!/bin/sh
+# Set a file's mtime based on its name.
+#
+# Set TZ to interpret the name in a particular timezone.
+# Set DS envvar to shift the time by that many seconds.
+set -e -o pipefail # POSIX:2022
+
+in="$1"
+d2='([0-9][0-9])'
+pat='/([A-Za-z0-9]+_)?([0-9][0-9][0-9][0-9])'"${d2}${d2}_${d2}${d2}${d2}"'.*\.(jpg|png|mp4|lrv|thm|mov)/\2-\3-\4 \5:\6:\7/i'
+
+test -n "$TZ" || { echo >&2 "TZ not set; abort"; exit 1; }
+
+t="$(basename "$in" | sed -nre "s${pat}gp")"
+if test -z "$t"; then
+	printf >&2 "filename \"$(basename "$in")\" failed to match: %s\n" "$pat"
+	exit 1
+fi
+ts="$(date +%s -d "$t")"
+ts="$((ts + DS))"
+
+echo >&2 "$in --> $(date -d "@$ts")"
+if [ -f "$in" -a "$ts" = "$(stat -c %Y "$in")" ]; then
+	exit 0
+fi
+
+execute=false
+if [ "$FORREALZ" = 1 ]; then
+	execute=true
+elif [ -n "$PS1" -o "$INTERACTIVE" = 1 ]; then
+	read -p "execute the above? [y/N] " x || true
+	if [ "$x" = "y" ]; then
+		execute=true
+	else
+		echo >&2 "aborted by user"
+	fi
+else
+	echo >&2 "set FORREALZ=1 to execute the above"
+fi
+
+if ! $execute; then
+	exit 1
+fi
+
+if ! test -f "$in"; then
+	echo >&2 "not a file: $in"
+	exit 1
+fi
+
+touch -c -d "@$ts" "$in"
