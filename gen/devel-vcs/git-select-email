@@ -12,7 +12,7 @@ GNUPGBIN="${GNUPGBIN:-gpg}"
 get_emails() {
 	local signingkey="$(git config user.signingkey)"
 	if test -n "$signingkey"; then
-		$GNUPGBIN --with-colons -k "$signingkey" | grep uid:u | cut -d: -f10 | sed -nre 's/.*<(.*)>.*/\1/gp'
+		$GNUPGBIN --with-colons -k "$signingkey" | grep uid:u | cut -d: -f10 | sed -nre 's/.*<(.*)>.*/\1/gp' || true
 	fi
 	git config --get-all user.selectableEmail || true
 }
@@ -20,7 +20,7 @@ get_emails() {
 emails="$(get_emails | sed -e 's/.*/\0 \0/g')"
 if test -z "$emails"; then
 	echo >&2 "abort: no emails detected; you need to either:"
-	echo >&2 "- set user.signingkey and we will use that GPG key's emails, or"
+	echo >&2 "- set user.signingkey to an ultimate-trust key in your GPG keyring, or"
 	echo >&2 "- set user.selectableEmail one or more times"
 	exit 1
 fi
