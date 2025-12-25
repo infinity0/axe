@@ -1,0 +1,28 @@
+#!/bin/sh
+# Regenerate .stow-local-ignore files from non-executables.
+#
+# Unfortunately we have to maintain these files, because stow(1) does not
+# provide a way to pass in a different path that would allow us to have the
+# contents be dynamically passed in by a script.
+#
+# You should review "git diff" afterwards and only commit anything relevant.
+set -e -o pipefail # POSIX:2022
+
+scriptdir="$(dirname "$0")"
+cd "$scriptdir"
+
+find . -mindepth 1 -maxdepth 1 -type d \
+  -not -name bin -not -name .git -printf "%P\n" | sort | while read p; do
+	for i in $(ls "$p"); do
+		( cd "$p/$i"
+		find . -maxdepth 1 -not \( -xtype f -a -executable \) \
+		  -a -not -name .stow-local-ignore \
+		  -a -not -name . \
+		  | sort | sed -r -e 's/[\\^.$|()*+?{}]/\\\0/g' -e 's,^\\\./,^/,g' > .stow-local-ignore
+		# list of all perl metachars: https://perldoc.perl.org/perlre#Metacharacters
+		if ! [ -s .stow-local-ignore ]; then
+			rm -f .stow-local-ignore
+		fi
+		)
+	done
+done
